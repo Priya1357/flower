@@ -114,7 +114,7 @@ async function callGemini(systemPrompt, userPrompt, maxTokens = 2048) {
       generationConfig: {
         responseMimeType: 'application/json',
         temperature: 0.7,
-        maxOutputTokens: maxTokens * 2  // Gemini needs more room than OpenRouter
+        maxOutputTokens: 8192  // Gemini needs more room than OpenRouter
         }
     })
   });
