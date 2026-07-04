@@ -1,7 +1,8 @@
 /**
  * AI Service
- * Handles all AI API calls via OpenRouter
- * Model: mistralai/mistral-7b-instruct (free tier)
+ * Handles all AI API calls via OpenRouter with Gemini fallback
+ * Primary: openrouter/auto:free
+ * Fallback: Google Gemini 2.5 Flash (free tier)
  */
 
 import {
@@ -11,62 +12,50 @@ import {
 } from '../utils/buildPrompt.js';
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const MODEL = 'openrouter/auto:free';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+const OPENROUTER_MODEL = 'openrouter/auto:free';
+
 // ─────────────────────────────────────────────
 // JSON Parser — three-strategy fallback
-// Mistral sometimes wraps JSON in prose or markdown
-// so we try multiple extraction strategies before giving up
+// Works for both OpenRouter and Gemini responses
 // ─────────────────────────────────────────────
-function parseResponse(response) {
-  const content = response.choices?.[0]?.message?.content || '';
+function extractJSON(text) {
+  if (!text) throw new Error('Empty response from AI');
 
-  if (!content) {
-    console.error('[OpenRouter] Empty response content');
-    throw new Error('Empty response from AI');
-  }
+  console.log('[AI] Raw response preview:', text.substring(0, 200));
 
-  console.log('[OpenRouter] Raw response preview:', content.substring(0, 200));
+  // Strategy 1 — parse as-is
+  try { return JSON.parse(text.trim()); } catch {}
 
-  // Strategy 1 — parse as-is (clean JSON, best case)
-  try {
-    return JSON.parse(content.trim());
-  } catch {}
-
-  // Strategy 2 — strip markdown fences then parse
-  const stripped = content
+  // Strategy 2 — strip markdown fences
+  const stripped = text
     .replace(/```json\s*/gi, '')
     .replace(/```\s*/gi, '')
     .trim();
-  try {
-    return JSON.parse(stripped);
-  } catch {}
+  try { return JSON.parse(stripped); } catch {}
 
-  // Strategy 3 — extract first { ... } block from anywhere in the response
-  // handles cases where Mistral adds prose before or after the JSON
-  const jsonMatch = content.match(/\{[\s\S]*\}/);
+  // Strategy 3 — extract first { ... } block
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
-    try {
-      return JSON.parse(jsonMatch[0]);
-    } catch {}
+    try { return JSON.parse(jsonMatch[0]); } catch {}
   }
 
-  // All strategies failed
-  console.error('[OpenRouter] All JSON parse strategies failed.');
-  console.error('[OpenRouter] Full response:', content);
-  throw new Error('Invalid JSON response from AI — could not extract valid JSON');
+  console.error('[AI] All JSON parse strategies failed. Full response:', text);
+  throw new Error('Invalid JSON response from AI');
 }
 
 // ─────────────────────────────────────────────
-// Core API caller
+// OpenRouter caller (primary)
+// Key is read INSIDE the function to avoid
+// ES module timing issue with dotenv
 // ─────────────────────────────────────────────
 async function callOpenRouter(systemPrompt, userPrompt, maxTokens = 1024) {
-  const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;  // ← ADD THIS
-  console.log('[OpenRouter] Key check:', OPENROUTER_API_KEY ? 'LOADED ✅' : 'MISSING ❌');
-  console.log('[OpenRouter] Sending request — model:', MODEL, '| max_tokens:', maxTokens);
+  const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
-  if (!OPENROUTER_API_KEY) {
-    throw new Error('OPENROUTER_API_KEY is not set in environment variables');
-  }
+  console.log('[OpenRouter] Key check:', OPENROUTER_API_KEY ? 'LOADED ✅' : 'MISSING ❌');
+  console.log('[OpenRouter] Sending request — model:', OPENROUTER_MODEL);
+
+  if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY is not set');
 
   const response = await fetch(OPENROUTER_URL, {
     method: 'POST',
@@ -77,7 +66,7 @@ async function callOpenRouter(systemPrompt, userPrompt, maxTokens = 1024) {
       'X-Title': 'Find Your Flower'
     },
     body: JSON.stringify({
-      model: MODEL,
+      model: OPENROUTER_MODEL,
       max_tokens: maxTokens,
       messages: [
         { role: 'system', content: systemPrompt },
@@ -90,45 +79,90 @@ async function callOpenRouter(systemPrompt, userPrompt, maxTokens = 1024) {
     const errorText = await response.text();
     console.error('[OpenRouter] API error:', response.status, errorText);
 
-    if (response.status === 401) throw new Error('Invalid OpenRouter API key');
-    if (response.status === 402) throw new Error('OpenRouter free credits exhausted — add credits or switch model');
-    if (response.status === 429) {
-      console.log('[OpenRouter] Rate limited — waiting 5 seconds and retrying once...');
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      // Retry once
-      const retryResponse = await fetch(OPENROUTER_URL, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://find-your-flower.app',
-          'X-Title': 'Find Your Flower'
-    },
-        body: JSON.stringify({
-        model: MODEL,
-        max_tokens: maxTokens,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-      ]
-    })
-  });
-
-  if (!retryResponse.ok) {
-    throw new Error('Rate limit hit — please wait a moment and try again');
-  }
-      const retryData = await retryResponse.json();
-      console.log('[OpenRouter] Retry succeeded — tokens used:',
-retryData.usage?.total_tokens ?? 'unknown'); // ← ADD THIS
-      return parseResponse(retryData);
-}
-    throw new Error(`OpenRouter API error: ${response.status}`);
+    if (response.status === 401) throw new Error('AUTH_ERROR: Invalid OpenRouter API key');
+    if (response.status === 402) throw new Error('CREDITS_ERROR: OpenRouter credits exhausted');
+    if (response.status === 429) throw new Error('RATE_LIMIT: OpenRouter rate limit hit');
+    throw new Error(`OPENROUTER_ERROR: ${response.status}`);
   }
 
   const data = await response.json();
   console.log('[OpenRouter] Response received — tokens used:', data.usage?.total_tokens ?? 'unknown');
+  console.log('[OpenRouter] Retry succeeded — tokens used:', data.usage?.total_tokens ?? 'unknown');
 
-  return parseResponse(data);
+  const content = data.choices?.[0]?.message?.content || '';
+  return extractJSON(content);
+}
+
+// ─────────────────────────────────────────────
+// Gemini caller (fallback)
+// Key is read INSIDE the function to avoid
+// ES module timing issue with dotenv
+// maxOutputTokens set high (8192) to prevent
+// JSON truncation on long responses
+// ─────────────────────────────────────────────
+async function callGemini(systemPrompt, userPrompt, maxTokens = 1024) {
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+  console.log('[Gemini] Key check:', GEMINI_API_KEY ? 'LOADED ✅' : 'MISSING ❌');
+  console.log('[Gemini] Sending request — model: gemini-2.5-flash');
+
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set');
+
+  const response = await fetch(`${GEMINI_URL}?key=${GEMINI_API_KEY}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      system_instruction: {
+        parts: [{ text: systemPrompt }]
+      },
+      contents: [{
+        parts: [{ text: userPrompt }]
+      }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.7,
+        maxOutputTokens: 8192  // High limit to prevent JSON truncation
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('[Gemini] API error:', response.status, errorText);
+
+    if (response.status === 429) throw new Error('RATE_LIMIT: Gemini rate limit hit');
+    throw new Error(`GEMINI_ERROR: ${response.status}`);
+  }
+
+  const data = await response.json();
+  console.log('[Gemini] Response received');
+
+  const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return extractJSON(content);
+}
+
+// ─────────────────────────────────────────────
+// Smart caller — tries OpenRouter first,
+// silently falls back to Gemini on rate limit.
+// Auth errors and credit errors surface immediately.
+// ─────────────────────────────────────────────
+async function callAI(systemPrompt, userPrompt, maxTokens = 1024) {
+  try {
+    return await callOpenRouter(systemPrompt, userPrompt, maxTokens);
+  } catch (error) {
+    // Only fall back to Gemini on rate limit or server errors
+    if (error.message.startsWith('RATE_LIMIT') || error.message.startsWith('OPENROUTER_ERROR')) {
+      console.log('[AI] OpenRouter failed — switching to Gemini fallback 🔄');
+      try {
+        return await callGemini(systemPrompt, userPrompt, maxTokens);
+      } catch (geminiError) {
+        console.error('[Gemini] Fallback also failed:', geminiError.message);
+        throw new Error('Our AI services are temporarily busy. Please wait a moment and try again.');
+      }
+    }
+    // Auth/credit errors — throw immediately with clear message
+    throw error;
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -146,13 +180,11 @@ IMPORTANT: Your response must be a single valid JSON object and nothing else.
 Start with { and end with }. No other text before or after.
 Example: { "flowerName": "Lotus" }`;
 
-  const result = await callOpenRouter(prompts.systemPrompt, reinforcedUserPrompt, 256);
+  const result = await callAI(prompts.systemPrompt, reinforcedUserPrompt, 256);
 
   console.log('[claudeService] Step 1 result:', result);
 
-  if (!result.flowerName) {
-    throw new Error('AI did not return a flowerName in Step 1');
-  }
+  if (!result.flowerName) throw new Error('AI did not return a flowerName in Step 1');
 
   return result;
 }
@@ -171,7 +203,7 @@ export async function getFlowerProfile(answers, flowerName, wikipediaContent) {
 IMPORTANT: Your response must be a single valid JSON object and nothing else.
 Start with { and end with }. No explanation, no markdown, no text outside the JSON.`;
 
-  const result = await callOpenRouter(prompts.systemPrompt, reinforcedUserPrompt, 1024);
+  const result = await callAI(prompts.systemPrompt, reinforcedUserPrompt, 1024);
 
   console.log('[claudeService] Step 2 result fields:', Object.keys(result));
 
@@ -199,7 +231,7 @@ IMPORTANT: Your response must be a single valid JSON object and nothing else.
 Start with { and end with }. No explanation, no markdown, no text outside the JSON.
 The personalityTraits field must be a JSON array of strings like: ["trait1", "trait2", "trait3"]`;
 
-  const result = await callOpenRouter(prompts.systemPrompt, reinforcedUserPrompt, 1024);
+  const result = await callAI(prompts.systemPrompt, reinforcedUserPrompt, 1024);
 
   console.log('[claudeService] Flower Meaning result fields:', Object.keys(result));
 
@@ -207,15 +239,9 @@ The personalityTraits field must be a JSON array of strings like: ["trait1", "tr
   if (result.personalityTraits && !Array.isArray(result.personalityTraits)) {
     result.personalityTraits = [result.personalityTraits];
   }
-  if (!result.personalityTraits) {
-    result.personalityTraits = [];
-  }
+  if (!result.personalityTraits) result.personalityTraits = [];
 
   return result;
 }
 
-export default {
-  findFlowerName,
-  getFlowerProfile,
-  getFlowerMeaning
-};
+export default { findFlowerName, getFlowerProfile, getFlowerMeaning };
