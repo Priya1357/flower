@@ -93,7 +93,7 @@ async function callOpenRouter(systemPrompt, userPrompt, maxTokens = 1024) {
 // ─────────────────────────────────────────────
 // Gemini caller (fallback)
 // ─────────────────────────────────────────────
-async function callGemini(systemPrompt, userPrompt) {
+async function callGemini(systemPrompt, userPrompt, maxTokens = 2048) {
   const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
   console.log('[Gemini] Key check:', GEMINI_API_KEY ? 'LOADED ✅' : 'MISSING ❌');
@@ -147,7 +147,7 @@ async function callAI(systemPrompt, userPrompt, maxTokens = 1024) {
     if (error.message.startsWith('RATE_LIMIT') || error.message.startsWith('OPENROUTER_ERROR')) {
       console.log('[AI] OpenRouter failed — switching to Gemini fallback 🔄');
       try {
-        return await callGemini(systemPrompt, userPrompt);
+        return await callGemini(systemPrompt, userPrompt, maxTokens);
       } catch (geminiError) {
         console.error('[Gemini] Fallback also failed:', geminiError.message);
         // Both services failed — throw a user-friendly error
